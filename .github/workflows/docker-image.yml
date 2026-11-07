@@ -12,6 +12,9 @@ on:
         description: "Image tag to build, for example v1.0.0"
         required: false
 # 构建任务
+env:
+  ACR_HOST: crpi-8l7h3z38ikkatd81.cn-shanghai.personal.cr.aliyuncs.com
+  ACR: crpi-8l7h3z38ikkatd81.cn-shanghai.personal.cr.aliyuncs.com/peak-aiot
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -39,19 +42,17 @@ jobs:
           # 添加仓库名小写转换
           echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
       
-      # 登录各个镜像仓库
+      # 登录镜像仓库
       - name: 登录镜像仓库
         run: |
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
-          echo "${{ secrets.IMAGE_PASS }}" | docker login registry.cn-hangzhou.aliyuncs.com -u ${{ secrets.IMAGE_USER }} --password-stdin
+          echo "${{ secrets.IMAGE_PASS }}" | docker login ${{ env.ACR_HOST }} -u ${{ secrets.IMAGE_USER }} --password-stdin
       
       # 设置 Docker Buildx
       - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@v3
       
-      # 构建并推送到 DockerHub 和 GitHub
-      - name: 构建并推送到 GitHub/DockerHub
+      # 构建并推送到你的阿里云 ACR
+      - name: 构建并推送到 ACR
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -59,6 +60,50 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            thingspanel/thingspanel-adapter-http:${{ env.VERSION }}
-            ghcr.io/${{ env.OWNER_LC }}/thingspanel-adapter-http:${{ env.VERSION }}
-            registry.cn-hangzhou.aliyuncs.com/thingspanel/thingspanel-adapter-http:${{ env.VERSION }}
+            ${{ env.ACR }}/thingspanel-adapter-http:${{ env.VERSION }}
+  deploy:
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_KEY"
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${DEPLOY_PORT:-22}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: Login ACR on server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          ACR_VPC_HOST: crpi-8l7h3z38ikkatd81-vpc.cn-shanghai.personal.cr.aliyuncs.com
+          ACR_USER: ${{ secrets.IMAGE_USER }}
+          ACR_PASS: ${{ secrets.IMAGE_PASS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ACR_PASS" | ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "docker login '$ACR_VPC_HOST' -u '$ACR_USER' --password-stdin"
+      - name: Update http adapter service
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          VERSION: ${{ github.event.release.tag_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" "$DEPLOY_USER@$DEPLOY_HOST" "
+            set -e
+            cd /opt/thingspanel
+            sed -i 's#^TP_TAG_HTTP_ADAPTER=.*#TP_TAG_HTTP_ADAPTER=${VERSION}#' .env
+            docker compose pull http_adapter
+            docker compose up -d http_adapter
+            docker compose ps http_adapter
+          "
